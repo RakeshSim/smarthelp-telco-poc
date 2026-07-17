@@ -227,6 +227,44 @@ aws s3 rb s3://telco-support-poc-tfstate-$STATE_SUFFIX --force
 aws dynamodb delete-table --table-name telco-support-poc-tf-locks
 ```
 
+## Deployment history — how this has actually been shipped so far
+
+Being explicit about this because it's a common interview follow-up
+("where's this hosted, how'd you deploy it") and because it's a deliberate,
+staged choice, not an oversight:
+
+- **Source control:** local git repo only so far (`git init` in this
+  directory, 2 commits). **No GitHub remote configured yet** — nothing has
+  been pushed anywhere.
+- **Deploy mechanism for Phase 1: manual, from a local machine.** No
+  pipeline exists yet. The sequence that actually happened:
+  1. Installed the AWS CLI and Terraform locally (`brew install awscli`,
+     `brew install hashicorp/tap/terraform`).
+  2. Configured credentials with `aws configure` (an IAM user with
+     `AdministratorAccess`, scoped to a personal sandbox account — verified
+     with `aws sts get-caller-identity`).
+  3. Ran the one-time bootstrap (S3 state bucket + DynamoDB lock table)
+     via raw `aws` CLI commands, since Terraform can't create the backend
+     it's about to store its own state in.
+  4. `terraform init -backend-config=envs/dev/backend.hcl`, then
+     `terraform plan` / `terraform apply -var-file=envs/dev/dev.tfvars` —
+     applied directly against AWS account `705365103500`, region
+     `us-east-1`.
+  5. Verified the result wasn't just "terraform says success" — hit the
+     live API Gateway URL with `curl` for `/health` and `/cases` (valid and
+     invalid payloads), then tailed the actual CloudWatch log group
+     (`aws logs tail /aws/lambda/telco-support-dev-router`) to confirm the
+     Powertools structured logs (`cold_start`, `xray_trace_id`,
+     `function_request_id`) were landing correctly.
+- **This is intentional, not a gap:** doing Phases 1–3 with manual
+  `terraform apply` means every new AWS concept (state locking, IAM roles,
+  Step Functions, human-approval tokens, etc.) gets seen directly, one
+  `apply` at a time, instead of being hidden behind a pipeline before it's
+  understood. **Phase 4 is exactly this gap being closed on purpose:**
+  push to a GitHub remote, then add GitHub Actions to do lint → pytest →
+  `terraform plan` on PR → `terraform apply` on merge to `main` — the same
+  stages the real production system ran through Jenkins + SonarQube.
+
 ## Interview Q&A (running list — grows every phase)
 
 - **"Walk me through what happens when a request comes in."** → see Request
@@ -241,6 +279,48 @@ aws dynamodb delete-table --table-name telco-support-poc-tf-locks
   in Terraform so nothing that costs real money deploys by accident, no NAT
   Gateway anywhere, `terraform destroy` documented, resources tagged for
   Cost Explorer.
+- **"Is this running through a CI/CD pipeline?"** → Not yet, by design —
+  see "Deployment history" above. Phases 1–3 are deployed manually so each
+  new AWS service is understood in isolation before automation hides the
+  mechanics; Phase 4 adds GitHub Actions (lint/test/plan on PR, apply on
+  merge), mirroring the real system's Jenkins + SonarQube stages.
+
+## Learning notes (Phase 1) — concepts to know cold for interviews
+
+Things worth being able to explain confidently, not just having typed:
+
+1. **Terraform's plan/apply model.** State (now in the S3 bucket) is
+   Terraform's record of what it believes exists; `plan` diffs that record
+   against your `.tf` files before anything touches AWS. Running `plan`
+   again with no code changes should show "0 to add, 0 to change,
+   0 to destroy" — that's the mental model for everything built from here on.
+2. **IAM: trust policy vs. permission policy.** See
+   `infra/modules/lambda/main.tf` — `assume_role_policy` (trust policy)
+   says *who* can assume the role (the Lambda service principal);
+   `aws_iam_role_policy` (permission policy) says *what* it can do once
+   assumed. Conflating these two is one of the most common IAM mistakes.
+3. **Lambda execution model.** Cold start vs. warm (visible in the
+   CloudWatch logs as `"cold_start":true`/`false`), the `(event, context)`
+   handler signature, and that a layer is just a zip mounted onto
+   `PYTHONPATH` — nothing more exotic than that.
+4. **API Gateway `AWS_PROXY` integration.** The raw event is handed to
+   Lambda untouched, and Lambda's response must match the expected shape
+   (`statusCode`/`body`/`headers`) or API Gateway returns a 500 — that
+   contract is the whole reason `APIGatewayHttpResolver` exists.
+5. **CloudWatch log retention.** Lambda log groups default to *infinite*
+   retention if you don't set one — `log_retention_days` in the `lambda`
+   module exists specifically to avoid that silent cost creep at scale.
+
+**Exercises that build intuition on what's already deployed:**
+- Change the `/health` response text, run `terraform plan` — notice only
+  the Lambda's `source_code_hash` changes, nothing else is touched.
+- Deliberately break the handler path and `apply` — compare what an
+  "infra is wrong" Terraform error looks like vs. what a broken-handler
+  Lambda invocation looks like in CloudWatch. Telling those apart quickly
+  is a real on-call skill.
+- Run `aws lambda get-function --function-name telco-support-dev-router`
+  and read the raw JSON — ties the console/Terraform view back to the
+  underlying API.
 
 ## Phases
 
