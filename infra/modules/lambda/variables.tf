@@ -42,9 +42,23 @@ variable "environment_variables" {
 }
 
 variable "additional_policy_json" {
-  description = "Optional extra IAM policy document (JSON) to attach to the function's execution role, e.g. DynamoDB/SQS/SNS access needed by later phases. Leave null for a log-only role."
+  description = "Optional extra IAM policy document (JSON) to attach to the function's execution role, e.g. DynamoDB/SQS/SNS access. Only used when has_additional_policy is true."
   type        = string
   default     = null
+}
+
+variable "has_additional_policy" {
+  description = <<-EOT
+    Whether to attach additional_policy_json. A plain bool rather than
+    inferring this from `additional_policy_json == null`, because that
+    policy JSON is usually built from an aws_iam_policy_document data
+    source referencing other resources' ARNs (e.g. a DynamoDB table)
+    that don't exist yet on a first apply — Terraform can't resolve a
+    count based on comparing an unknown value to null at plan time.
+    A literal true/false at the call site sidesteps that entirely.
+  EOT
+  type        = bool
+  default     = false
 }
 
 variable "log_retention_days" {

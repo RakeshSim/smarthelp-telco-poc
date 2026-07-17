@@ -1,0 +1,135 @@
+{
+  "Comment": "SmartHelp telco support diagnose/act/resolve loop with a human-approval gate before network-impacting actions.",
+  "StartAt": "TriggerDiagnostics",
+  "States": {
+    "TriggerDiagnostics": {
+      "Type": "Task",
+      "Resource": "${diagnose_arn}",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "HandleFailure" }
+      ],
+      "Next": "InterpretDiagnostics"
+    },
+
+    "InterpretDiagnostics": {
+      "Type": "Task",
+      "Resource": "${interpret_diagnostics_arn}",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "HandleFailure" }
+      ],
+      "Next": "NeedsApproval"
+    },
+
+    "NeedsApproval": {
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.decision.network_impacting", "BooleanEquals": true, "Next": "RequestApproval" }
+      ],
+      "Default": "TakeAction"
+    },
+
+    "RequestApproval": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${request_approval_arn}",
+        "Payload": {
+          "TaskToken.$": "$$.Task.Token",
+          "input.$": "$"
+        }
+      },
+      "TimeoutSeconds": 86400,
+      "ResultPath": "$.approval",
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "HandleFailure" }
+      ],
+      "Next": "ApprovalGranted"
+    },
+
+    "ApprovalGranted": {
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.approval.approved", "BooleanEquals": true, "Next": "TakeAction" }
+      ],
+      "Default": "Resolver"
+    },
+
+    "TakeAction": {
+      "Type": "Task",
+      "Resource": "${act_arn}",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "HandleFailure" }
+      ],
+      "Next": "InterpretResults"
+    },
+
+    "InterpretResults": {
+      "Type": "Task",
+      "Resource": "${interpret_results_arn}",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "HandleFailure" }
+      ],
+      "Next": "Resolved"
+    },
+
+    "Resolved": {
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.outcome.resolved", "BooleanEquals": true, "Next": "Resolver" }
+      ],
+      "Default": "TriggerDiagnostics"
+    },
+
+    "Resolver": {
+      "Type": "Task",
+      "Resource": "${resolver_arn}",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "End": true
+    },
+
+    "HandleFailure": {
+      "Type": "Task",
+      "Resource": "${resolver_arn}",
+      "End": true
+    }
+  }
+}

@@ -25,6 +25,30 @@ variable "log_retention_days" {
   default     = 14
 }
 
+variable "max_diagnostic_attempts" {
+  description = <<-EOT
+    Written to SSM Parameter Store and read by the starter Lambda at
+    runtime (demonstrates reading runtime config from a config store,
+    not just baking it into Lambda env vars). Caps how many
+    diagnose/act loops run before the workflow escalates to a
+    technician dispatch instead of retrying forever.
+  EOT
+  type        = number
+  default     = 2
+}
+
+variable "approver_email" {
+  description = "Optional email to subscribe to the ops-approval SNS topic (requires clicking a confirmation link AWS emails you). Leave empty to review/approve pending cases via the AWS CLI or Step Functions console instead."
+  type        = string
+  default     = ""
+}
+
+variable "customer_notification_email" {
+  description = "Optional email to subscribe to the customer-notifications SNS topic, simulating the customer-facing channel. Leave empty to skip."
+  type        = string
+  default     = ""
+}
+
 # --- Optional tiers (Phase 5) ---------------------------------------------
 # Kept false so `terraform apply` never provisions anything that costs money
 # beyond the always-free-tier LIVE services. Flip to true deliberately and

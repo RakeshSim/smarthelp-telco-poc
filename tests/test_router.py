@@ -1,19 +1,10 @@
+import importlib
 import json
+import os
 
+import boto3
 import handler
-import pytest
-
-
-class _FakeLambdaContext:
-    function_name = "telco-support-dev-router"
-    memory_limit_in_mb = 128
-    invoked_function_arn = "arn:aws:lambda:us-east-1:123456789012:function:telco-support-dev-router"
-    aws_request_id = "test-request-id"
-
-
-@pytest.fixture
-def lambda_context():
-    return _FakeLambdaContext()
+from moto import mock_aws
 
 
 def _apigw_event(method: str, path: str, body: dict | None = None) -> dict:
@@ -50,15 +41,34 @@ def test_health_returns_ok(lambda_context):
     assert json.loads(response["body"]) == {"status": "ok", "service": "telco-support-router"}
 
 
-def test_create_case_accepts_valid_body(lambda_context):
+@mock_aws
+def test_create_case_enqueues_and_returns_202(lambda_context):
+    sqs = boto3.client("sqs", region_name="us-east-1")
+    # Queue name must match the one baked into CASES_QUEUE_URL in
+    # conftest.py, so moto's queue lookup and our env var agree.
+    sqs.create_queue(QueueName="telco-support-test-cases")
+
+    # handler.py creates its SQS client at module scope (the same pattern
+    # the real Lambda uses, to reuse the client across warm invocations).
+    # It was imported at collection time, before @mock_aws activated, so
+    # reload it now — a well-known moto gotcha with module-level clients.
+    importlib.reload(handler)
+
     body = {"customer_id": "cust-123", "issue_type": "modem_offline"}
     response = handler.lambda_handler(_apigw_event("POST", "/cases", body), lambda_context)
 
-    assert response["statusCode"] == 200
-    assert json.loads(response["body"]) == {
-        "message": "case received",
+    assert response["statusCode"] == 202
+    payload = json.loads(response["body"])
+    assert payload["message"] == "case accepted"
+    assert payload["case_id"].startswith("case-")
+
+    messages = sqs.receive_message(QueueUrl=os.environ["CASES_QUEUE_URL"], MaxNumberOfMessages=1)["Messages"]
+    enqueued = json.loads(messages[0]["Body"])
+    assert enqueued == {
+        "case_id": payload["case_id"],
         "customer_id": "cust-123",
         "issue_type": "modem_offline",
+        "submitted_at": enqueued["submitted_at"],
     }
 
 
