@@ -8,7 +8,10 @@ the resolution. This repo is both a deployable AWS project and my interview
 study guide for it — architecture rationale and Q&A live in this README as
 the project grows.
 
-**Status: Phase 1 of 5 — API Gateway → Lambda is live.** Everything else in
+**Status: Phase 1 of 5 — deployed and verified in `dev`.** API Gateway →
+Lambda is live (`GET /health`, `POST /cases` both tested end-to-end against
+the real AWS endpoint, including the powertools structured logs landing in
+CloudWatch). Everything else in
 the architecture diagram below is designed but not yet built; phases are
 tracked at the bottom of this file.
 
@@ -108,6 +111,13 @@ make it easy to accidentally apply the wrong `.tfvars` against the wrong
 state — separate backend keys per env (`dev/terraform.tfstate`,
 `qa/...`, `prod/...`) make the blast radius of a mistake smaller and the
 `terraform init` command itself makes the target environment explicit.
+
+*Note:* recent AWS provider versions support native S3 locking
+(`use_lockfile = true`, conditional writes, no DynamoDB table needed) and
+deprecate the `dynamodb_table` backend parameter this repo uses. I kept the
+DynamoDB-lock pattern deliberately — it's still fully supported, and it's
+the pattern most interviewers will recognize; worth mentioning the newer
+alternative exists if asked.
 
 **Tagging strategy:** every resource gets `Project=telco-support-poc` and
 `Environment=<env>` via the AWS provider's `default_tags`, so Cost Explorer
