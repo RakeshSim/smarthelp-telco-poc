@@ -1,0 +1,7 @@
+aws-lambda-powertools==3.4.0
+pytest==8.3.4
+pytest-cov==6.0.0
+moto[all]==5.0.28
+boto3==1.35.99
+ruff==0.9.3
+black==24.10.0
