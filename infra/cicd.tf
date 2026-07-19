@@ -214,6 +214,27 @@ data "aws_iam_policy_document" "gha_apply_project" {
     actions   = ["sts:GetCallerIdentity"]
     resources = ["*"]
   }
+
+  # The apply role needs to read/manage the very OIDC provider its own
+  # trust policy depends on — Terraform refreshes this resource's state
+  # (and would need to update/recreate it) on every apply. Discovered
+  # empirically: the first real `terraform apply` over OIDC failed with
+  # AccessDenied on iam:GetOpenIDConnectProvider, since this ARN
+  # namespace (oidc-provider/...) isn't covered by the role/* pattern
+  # above.
+  statement {
+    sid = "ManageOwnOidcProvider"
+    actions = [
+      "iam:GetOpenIDConnectProvider",
+      "iam:CreateOpenIDConnectProvider",
+      "iam:DeleteOpenIDConnectProvider",
+      "iam:UpdateOpenIDConnectProviderThumbprint",
+      "iam:TagOpenIDConnectProvider",
+      "iam:UntagOpenIDConnectProvider",
+      "iam:ListOpenIDConnectProviderTags",
+    ]
+    resources = [aws_iam_openid_connect_provider.github_actions[0].arn]
+  }
 }
 
 resource "aws_iam_role_policy" "gha_apply_project" {
