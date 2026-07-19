@@ -8,22 +8,25 @@ the resolution. This repo is both a deployable AWS project and my interview
 study guide for it — architecture rationale and Q&A live in this README as
 the project grows.
 
-**Status: Phase 3 of 5 — deployed and verified in `dev`.** The full
-diagnose → interpret → act → interpret loop runs end-to-end on real AWS: a
-case submitted through API Gateway is picked up off SQS, run through a
-Step Functions Standard workflow, paused at a `waitForTaskToken` gate for
-network-impacting actions, resumed via the AWS CLI, and resolved with the
-final state written to DynamoDB and a customer notification published to
-SNS. A scheduled reaper Lambda reconciles sessions orphaned by executions
-that die outside their own error handling, every resolved case lands one
-analytics record in S3 queryable via Athena with zero crawler/ETL infra,
-and a CloudWatch dashboard rolls up API Gateway, Step Functions, SQS,
-Lambda, and DynamoDB metrics in one place. All of it — the approval
-pause/resume loop (including a second approval gate after a failed
-reboot), a simulated orphaned session getting reconciled by the reaper,
-and an Athena query against the resulting data — has been exercised
-against the live deployment. Phase 4+ are designed but not yet built;
-phases are tracked at the bottom of this file.
+**Status: Phase 4 of 5 — deployed and verified in `dev`, now with CI/CD.**
+The full diagnose → interpret → act → interpret loop runs end-to-end on
+real AWS: a case submitted through API Gateway is picked up off SQS, run
+through a Step Functions Standard workflow, paused at a
+`waitForTaskToken` gate for network-impacting actions, resumed via the
+AWS CLI, and resolved with the final state written to DynamoDB and a
+customer notification published to SNS. A scheduled reaper Lambda
+reconciles sessions orphaned by executions that die outside their own
+error handling, every resolved case lands one analytics record in S3
+queryable via Athena with zero crawler/ETL infra, and a CloudWatch
+dashboard rolls up API Gateway, Step Functions, SQS, Lambda, and DynamoDB
+metrics in one place. The repo is now on GitHub
+([RakeshSim/smarthelp-telco-poc](https://github.com/RakeshSim/smarthelp-telco-poc))
+with a GitHub Actions pipeline: lint + pytest on every push/PR, a
+read-only `terraform plan` on pull requests, and `terraform apply` on
+merge to `main` gated behind a required manual approval — via two
+separate AWS IAM roles assumed through OIDC, not stored access keys.
+Phase 5 (optional Tier 2/3 modules) is designed but not yet built; phases
+are tracked at the bottom of this file.
 
 ## Architecture (target — grayed-out pieces arrive in later phases)
 
@@ -290,6 +293,7 @@ existing single write path handles it too.
 ```
 infra/
   versions.tf, providers.tf, variables.tf, main.tf, outputs.tf   # root module
+  cicd.tf                                                        # GitHub Actions OIDC provider + 2 IAM roles
   envs/{dev,qa,prod}/{backend.hcl, <env>.tfvars}                 # per-env config
   state_machine/telco_workflow.asl.json.tftpl                    # ASL, templated with each Lambda's ARN
   modules/
@@ -309,7 +313,7 @@ src/
   reaper/reaper.py                  # EventBridge-scheduled: reconciles orphaned/stale sessions
   layers/powertools/requirements.txt
 tests/                # pytest, one test module per Lambda (29 tests)
-.github/workflows/     # CI/CD (Phase 4)
+.github/workflows/ci.yml   # lint -> test -> plan (PRs) / apply (merge, gated)
 ```
 
 Phase 3's S3 bucket, Glue Catalog database/table, Athena workgroup,
@@ -373,6 +377,72 @@ subscribe a real address to the ops-approval / customer-notification SNS
 topics — AWS emails a confirmation link you have to click before messages
 start arriving. Left blank (the default), you verify everything via the
 AWS CLI/console instead, as the demo below does.
+
+## CI/CD Pipeline
+
+```mermaid
+flowchart LR
+    PR([Pull request]) --> Lint1["lint + pytest"]
+    Lint1 --> Plan["terraform plan\n(gha-plan role, read-only)"]
+    Plan -.posts.-> Summary["GitHub Step Summary"]
+
+    Merge([Merge to main]) --> Lint2["lint + pytest"]
+    Lint2 --> Gate{{"aws-deploy environment\nrequired reviewer"}}
+    Gate -->|approved| Apply["terraform apply\n(gha-apply role, write)"]
+    Apply --> AWS[("AWS account")]
+```
+
+`.github/workflows/ci.yml` runs on every PR and every push to `main`:
+
+1. **`lint`** — `ruff check` + `black --check`.
+2. **`test`** — the full pytest suite (29 tests) with coverage.
+3. **`terraform-plan`** (PRs only) — assumes the read-only `gha-plan` IAM
+   role via OIDC, runs `fmt -check` / `validate` / `plan` against `dev`,
+   and posts the plan output to the workflow's Step Summary so it's
+   visible without needing a separate PR-comment bot/action.
+4. **`terraform-apply`** (push to `main` only) — assumes the write-capable
+   `gha-apply` role, but only runs after a human approves it in the
+   `aws-deploy` GitHub Environment (configured with a required reviewer) —
+   so merging to `main` alone does **not** deploy; someone still has to
+   click approve.
+
+**Why OIDC instead of storing AWS access keys as GitHub secrets?** Access
+keys are long-lived credentials that work from anywhere if leaked — OIDC
+issues a short-lived token per workflow run, scoped by the identity
+provider's trust policy to (in this case) one specific GitHub repo, with
+no long-lived secret sitting in GitHub at all. `infra/cicd.tf` sets this
+up: one `aws_iam_openid_connect_provider` plus two roles.
+
+**Why two roles instead of one?** `gha-plan`'s trust policy accepts any
+ref in this repo (so a PR workflow can assume it) but only holds
+`ReadOnlyAccess` plus read/write on Terraform's own state object —
+harmless even if a malicious PR tried to abuse it. `gha-apply`'s trust
+policy is restricted with `StringEquals` (not `StringLike`) to exactly
+`repo:RakeshSim/smarthelp-telco-poc:ref:refs/heads/main` — only a
+workflow run triggered by a push to `main` can assume it, never a PR
+build. A single role trusted broadly but holding write access would mean
+any PR — including from a fork, if this were a more permissive repo
+config — could assume a role capable of changing real infrastructure.
+
+**Why does `gha-apply`'s policy scope IAM actions separately from
+everything else?** The rest of the policy (`lambda:*`, `dynamodb:*`,
+`states:*`, etc. on `Resource: "*"`) is broad because most of these
+resources' ARNs don't exist until Terraform creates them — a real
+bootstrap chicken-and-egg problem. IAM is the one service where I could
+still scope tightly regardless: the `ScopedIamForProjectRolesOnly`
+statement restricts every IAM action (including `iam:PassRole`) to
+`role/telco-support-*`. Without that restriction, a compromised or buggy
+merge to `main` could create/modify IAM roles anywhere in the account,
+not just this project's — scoping it is what actually prevents privilege
+escalation, not the illusion of least-privilege from a long action list.
+
+**Why a required reviewer on the environment instead of just letting
+`apply` run on every merge?** Mirrors the project spec's "apply on merge
+(gated)" requirement — the read-only `plan` on the PR gives you the diff
+*before* merging, but a human still has to explicitly click approve
+*after* merge, before anything actually changes in AWS. It's a cheap,
+free-tier way (GitHub Environment protection rules are free on public
+repos) to add a manual gate without a heavier external approval system.
 
 ## Demo
 
@@ -494,12 +564,12 @@ the CloudWatch dashboard (`terraform -chdir=infra output -raw dashboard_url`).
 
 ## Cost & Teardown
 
-Everything provisioned through Phase 3 (API Gateway, 9 Lambdas + a shared
+Everything provisioned through Phase 4 (API Gateway, 9 Lambdas + a shared
 layer, DynamoDB PAY_PER_REQUEST, SQS + DLQ, SNS, Step Functions Standard,
 SSM String parameters, S3 + Glue Catalog + Athena, EventBridge, CloudWatch
-log groups + dashboard) fits AWS Free Tier / pay-per-request pricing for
-demo-level traffic — nothing runs 24/7 or bills per-hour, **except one
-thing**:
+log groups + dashboard, an IAM OIDC provider + 2 IAM roles) fits AWS Free
+Tier / pay-per-request pricing for demo-level traffic — nothing runs
+24/7 or bills per-hour, **except one thing**:
 
 - **Secrets Manager** (`telco-support-dev-dispatch-api-key`) bills
   ~$0.40/month flat while it exists, regardless of how often it's read.
@@ -514,7 +584,10 @@ inside the 1M/month free tier. Athena bills $5 per TB scanned — a demo
 dataset of a few KB costs a fraction of a cent per query. S3 objects
 under `resolutions/` expire automatically after `analytics_retention_days`
 (30 by default) via a lifecycle rule, so the analytics dataset can't grow
-(or cost) unbounded even if this sits deployed indefinitely.
+(or cost) unbounded even if this sits deployed indefinitely. IAM (the
+OIDC provider and both CI roles) is always free, and GitHub Actions
+minutes/Environments are free for public repos — the whole CI/CD layer
+adds $0 regardless of how often the pipeline runs.
 
 To tear down:
 
@@ -538,11 +611,14 @@ Being explicit about this because it's a common interview follow-up
 ("where's this hosted, how'd you deploy it") and because it's a deliberate,
 staged choice, not an oversight:
 
-- **Source control:** local git repo only so far (`git init` in this
-  directory, 2 commits). **No GitHub remote configured yet** — nothing has
-  been pushed anywhere.
-- **Deploy mechanism for Phase 1: manual, from a local machine.** No
-  pipeline exists yet. The sequence that actually happened:
+- **Source control:** started as a local-only git repo through Phase 3
+  (no GitHub remote, nothing pushed). At the start of Phase 4, pushed to
+  a new public GitHub repo
+  ([RakeshSim/smarthelp-telco-poc](https://github.com/RakeshSim/smarthelp-telco-poc))
+  via `gh repo create ... --source=. --remote=origin`, then `git push -u
+  origin main` — full history intact, not squashed.
+- **Deploy mechanism for Phases 1–3: manual, from a local machine.** No
+  pipeline existed yet. The sequence that actually happened:
   1. Installed the AWS CLI and Terraform locally (`brew install awscli`,
      `brew install hashicorp/tap/terraform`).
   2. Configured credentials with `aws configure` (an IAM user with
@@ -671,6 +747,30 @@ staged choice, not an oversight:
   ETL job to periodically compact `resolutions/` into larger Parquet
   files — exactly the kind of thing the project's planned (not yet built)
   optional Tier 3 Glue module is for.
+- **"Walk me through how CI/CD authenticates to AWS."** → OIDC, not
+  stored access keys. GitHub's Actions runner requests a short-lived,
+  cryptographically signed JSON Web Token from GitHub's own OIDC
+  provider; AWS's `aws_iam_openid_connect_provider` trusts that issuer,
+  and each IAM role's trust policy checks the token's `aud` (audience)
+  and `sub` (subject — encodes the exact repo/ref) claims before issuing
+  temporary credentials via `sts:AssumeRoleWithWebIdentity`. No secret
+  ever lives in GitHub; the trust relationship is the only thing that
+  has to be configured, in `infra/cicd.tf`.
+- **"What stops a pull request from deploying infrastructure?"** → Two
+  independent controls, not one: the `gha-plan` role a PR's workflow
+  assumes only has `ReadOnlyAccess` (it *can't* change anything even if
+  it tried), and separately the `gha-apply` role's trust policy uses
+  `StringEquals` on the exact `sub` claim for a push to `main` — a PR
+  event produces a different `sub` value entirely, so it couldn't assume
+  that role even if it tried to. Belt and suspenders, not just one gate.
+- **"Why gate `apply` behind a required reviewer if `gha-apply` is
+  already restricted to `main`?"** → Different failure modes. The IAM
+  trust policy stops the *wrong workflow* (a PR) from deploying; the
+  required-reviewer environment stops the *right* workflow from
+  deploying *automatically* the instant someone merges, giving a human a
+  last look at the plan output before real AWS resources change. One is
+  an authentication control, the other is a change-management control —
+  worth naming the distinction if asked to justify having both.
 
 ## Learning notes (Phase 1) — concepts to know cold for interviews
 
@@ -800,6 +900,57 @@ Things worth being able to explain confidently, not just having typed:
 - Change `reaper_stale_after_minutes` in `dev.tfvars`, `terraform apply`,
   and watch the Lambda's env var update — confirms the config is actually
   wired through Terraform, not hardcoded, without needing to touch code.
+
+## Learning notes (Phase 4) — concepts to know cold for interviews
+
+1. **OIDC federation, concretely.** `sts:AssumeRoleWithWebIdentity` is the
+   mechanism — GitHub issues a signed JWT, AWS validates it against the
+   registered OIDC provider (`aws_iam_openid_connect_provider`) and the
+   role's trust policy conditions, then hands back temporary credentials.
+   No long-lived secret is exchanged at any point. This is the same
+   pattern Kubernetes IRSA (IAM Roles for Service Accounts) uses on
+   EKS — one mechanism, multiple identity providers.
+2. **Trust policy conditions are the actual security boundary, not the
+   permission policy.** `infra/cicd.tf`'s two roles have almost the same
+   *shape* of trust policy — the difference that matters is `StringLike`
+   (`repo:...:*`, matches any ref) vs. `StringEquals` on the exact `sub`
+   for `refs/heads/main`. Getting this condition operator/value wrong is
+   the single most common OIDC misconfiguration — being able to explain
+   *why* one uses `Like` and the other `Equals` is worth more than
+   reciting that OIDC is "more secure than access keys."
+3. **GitHub Environments are an authorization primitive, not just a
+   grouping label.** `environment: aws-deploy` in the workflow YAML is
+   what makes the required-reviewer protection rule actually block the
+   job — without referencing an environment, `needs:`/`if:` alone can't
+   express "pause and wait for a human," only "run when these conditions
+   are true."
+4. **Bootstrap policies are necessarily broader than steady-state
+   policies.** `gha-apply`'s project-services statement is scoped by
+   *service*, not resource ARN, because Terraform is creating those
+   resources for the first time — their ARNs don't exist yet to write a
+   tighter policy against. This is a real, common tension in IAM design:
+   you can tighten a policy once resources (and their ARNs/naming
+   patterns) are stable, but a bootstrap role usually can't start there.
+5. **`vars` vs. `secrets` in GitHub Actions.** The IAM role ARNs are
+   stored as repository **variables** (`gh variable set`), not
+   **secrets** — an ARN identifies a role but grants nothing by itself
+   (only the trust policy does), so there's nothing to protect by hiding
+   it. Reflexively marking everything "secret" obscures which values
+   actually need protecting.
+
+**Exercises that build intuition on what's already deployed:**
+- Open a trivial PR (e.g. a typo fix) against this repo and watch the
+  `terraform-plan` job run — check the Step Summary tab for the posted
+  plan output rather than digging through raw logs.
+- Try (in a scratch/throwaway way, not against this repo) crafting a
+  workflow run on a non-`main` branch that attempts to assume `gha-apply`
+  — confirm AWS denies it with an `AccessDenied`/trust-policy error, not
+  a permissions error, which is the tell that it's the *trust* policy
+  rejecting it, not the *permission* policy.
+- Look up the actual JWT GitHub Actions generates (`ACTIONS_ID_TOKEN_REQUEST_URL`
+  during a workflow run) and decode it at jwt.io — seeing the real `aud`
+  and `sub` claims makes the trust-policy conditions concrete instead of
+  abstract.
 
 ## Phases
 

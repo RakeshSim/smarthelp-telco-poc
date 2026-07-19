@@ -67,6 +67,25 @@ variable "analytics_retention_days" {
   default     = 30
 }
 
+variable "github_repo" {
+  description = "GitHub \"owner/repo\" this project lives in — scopes the GitHub Actions OIDC role's trust policy so only workflows running in this specific repo can assume it."
+  type        = string
+  default     = "RakeshSim/smarthelp-telco-poc"
+}
+
+variable "manage_github_oidc" {
+  description = <<-EOT
+    Whether this environment's Terraform manages the GitHub Actions OIDC
+    provider + roles. The OIDC provider is an account-global resource
+    (one per URL, not per environment) — only one environment should
+    manage it per AWS account, so this is true for dev and false for
+    qa/prod to avoid a duplicate-resource error if they ever share an
+    account.
+  EOT
+  type        = bool
+  default     = false
+}
+
 # --- Optional tiers (Phase 5) ---------------------------------------------
 # Kept false so `terraform apply` never provisions anything that costs money
 # beyond the always-free-tier LIVE services. Flip to true deliberately and

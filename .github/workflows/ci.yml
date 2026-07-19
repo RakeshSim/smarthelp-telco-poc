@@ -1,0 +1,98 @@
+name: CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check src tests
+      - run: black --check src tests
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt
+      - run: pytest --cov=src --cov-report=term-missing tests/
+
+  # Runs on every PR. Assumes the read-only "plan" role — safe to run
+  # against a PR from this repo, since it can't change anything.
+  terraform-plan:
+    if: github.event_name == 'pull_request'
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # required to request the OIDC token
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_GHA_PLAN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.9"
+      - name: terraform init
+        working-directory: infra
+        run: terraform init -input=false -backend-config=envs/dev/backend.hcl
+      - name: terraform fmt check
+        working-directory: infra
+        run: terraform fmt -check -recursive
+      - name: terraform validate
+        working-directory: infra
+        run: terraform validate
+      - name: terraform plan
+        working-directory: infra
+        run: |
+          terraform plan -input=false -var-file=envs/dev/dev.tfvars -no-color | tee /tmp/plan.txt
+          {
+            echo '## Terraform plan (dev)'
+            echo '```'
+            cat /tmp/plan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Runs only on a push to main (i.e. a merged PR). Assumes the write
+  # role, which is only assumable for this exact ref (see infra/cicd.tf) —
+  # and is gated behind the aws-deploy GitHub Environment's required
+  # reviewer, so a merge alone doesn't deploy without a manual approval.
+  terraform-apply:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    environment: aws-deploy
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_GHA_APPLY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.9"
+      - name: terraform init
+        working-directory: infra
+        run: terraform init -input=false -backend-config=envs/dev/backend.hcl
+      - name: terraform apply
+        working-directory: infra
+        run: terraform apply -input=false -auto-approve -var-file=envs/dev/dev.tfvars
