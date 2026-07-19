@@ -701,12 +701,31 @@ staged choice, not an oversight:
   OIDC provider resource on every apply and that ARN namespace wasn't
   covered by the role-scoped IAM statement. Every fix was verified by
   re-running the actual PR/merge/approve flow against live AWS and
-  GitHub, not just re-reading the Terraform. The final, successful
-  `terraform-apply` run replaced the Lambda layer and updated all 9
-  functions' layer reference once — expected, since the layer built on
-  my Mac and CI's Linux runner produce different zip bytes for identical
-  package content; confirmed this stabilizes going forward by observing
-  that a subsequent CI-triggered plan showed no further changes.
+  GitHub, not just re-reading the Terraform.
+- **Open, not fully resolved: the Lambda layer's zip hash isn't stable
+  build-to-build, even on identical CI runners with identical package
+  versions.** Every successful `terraform-apply` so far has replaced the
+  Powertools layer and updated all 9 functions' `layers` reference, not
+  just the first one. Confirmed it's not a platform difference (compared
+  `pip install` logs across runs — same `aws-lambda-powertools-3.4.0
+  jmespath-1.1.0 typing-extensions-4.16.0` both times) and not purely a
+  file-mtime issue (normalized every file to a fixed timestamp before
+  zipping — this measurably was the wrong provisioner the first time,
+  since `modules/lambda_layer`'s local-exec only re-runs when
+  `requirements.txt`'s hash changes, so moving the fix to the workflow
+  step that actually runs every time was itself a real, necessary
+  correction — but the hash still isn't stable after that fix either).
+  Likely remaining suspects: pip/wheel-extraction metadata (permission
+  bits, `RECORD`/`INSTALLER` file contents) that isn't fully
+  deterministic between install runs, independent of mtime. Functionally
+  harmless — republishing an identical-content layer version and
+  updating a function's `layers` pointer is a safe, zero-downtime
+  operation — but it means CI's `terraform-plan` currently can't be
+  trusted to show "no changes" as proof nothing changed; it'll show
+  this diff on unrelated PRs too. Documented here rather than hidden,
+  because knowing the difference between "fixed" and "worked around,
+  still investigating" is exactly the kind of judgment call worth being
+  honest about in an interview.
 
 ## Interview Q&A (running list — grows every phase)
 
@@ -821,17 +840,20 @@ staged choice, not an oversight:
   Terraform harder. Worth remembering generally: when an opaque
   auth-layer error doesn't say *why* it failed, get the actual claims/
   request instead of iterating on guesses.
-- **"Why did the first successful `terraform apply` from CI touch every
-  single Lambda function, not just the CI/CD resources you'd just
-  added?"** → `archive_file`'s hash isn't just a function of package
-  *content* — the zip a local `pip install` produces on macOS and the zip
-  the same command produces on CI's Ubuntu runner aren't byte-identical,
-  so the Lambda layer's version — and therefore every function's `layers`
-  reference — changed once when CI became the one building it. Expected
-  and harmless (same dependency versions, different build environment),
-  but a good example of *why* deploys should come from one consistent
-  place once CI/CD exists, rather than alternating between a laptop and
-  a pipeline against the same state.
+- **"Why did every `terraform apply` from CI touch every single Lambda
+  function, not just the CI/CD resources you'd just added?"** →
+  `archive_file`'s hash isn't purely a function of installed package
+  *content* — it hashes the actual zip bytes, which also capture file
+  metadata (mtimes, at minimum, possibly permission bits too). I fixed
+  the mtime piece — including tracking down that the fix initially landed
+  in a provisioner that no longer re-runs after its first execution — but
+  the layer still republishes on every apply, so there's at least one
+  more source of non-determinism I haven't isolated yet. Functionally
+  harmless (replacing a layer with identical logical content is safe and
+  fast), but it's an honest "still open" item, not a solved one — and a
+  good illustration of *why* deploys should come from one consistent
+  place once CI/CD exists, since a laptop and a pipeline building the
+  same artifact independently is exactly how this kind of drift shows up.
 
 ## Learning notes (Phase 1) — concepts to know cold for interviews
 
