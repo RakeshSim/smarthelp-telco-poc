@@ -48,7 +48,7 @@ def lambda_handler(event: dict, context: LambdaContext) -> None:
         ExpressionAttributeValues={
             ":status": "PENDING_APPROVAL",
             ":token": task_token,
-            ":now": str(int(time.time())),
+            ":now": int(time.time()),
         },
     )
 

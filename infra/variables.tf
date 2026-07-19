@@ -49,6 +49,24 @@ variable "customer_notification_email" {
   default     = ""
 }
 
+variable "reaper_schedule_expression" {
+  description = "EventBridge schedule expression that triggers the reaper Lambda."
+  type        = string
+  default     = "rate(15 minutes)"
+}
+
+variable "reaper_stale_after_minutes" {
+  description = "How long a session can sit in IN_PROGRESS/PENDING_APPROVAL before the reaper considers it for reconciliation."
+  type        = number
+  default     = 15
+}
+
+variable "analytics_retention_days" {
+  description = "S3 lifecycle expiration for analytics records — keeps the demo dataset from growing (and costing) indefinitely."
+  type        = number
+  default     = 30
+}
+
 # --- Optional tiers (Phase 5) ---------------------------------------------
 # Kept false so `terraform apply` never provisions anything that costs money
 # beyond the always-free-tier LIVE services. Flip to true deliberately and

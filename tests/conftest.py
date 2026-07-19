@@ -35,6 +35,8 @@ os.environ.setdefault(
 os.environ.setdefault(
     "DISPATCH_SECRET_ARN", "arn:aws:secretsmanager:us-east-1:123456789012:secret:telco-support-test-dispatch"
 )
+os.environ.setdefault("ANALYTICS_BUCKET_NAME", "telco-support-test-analytics")
+os.environ.setdefault("REAPER_STALE_AFTER_MINUTES", "15")
 
 
 class _FakeLambdaContext:

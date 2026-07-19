@@ -75,6 +75,12 @@ def _start_case(case: dict) -> None:
 
     table = _dynamodb.Table(_SESSIONS_TABLE)
     try:
+        # created_at/updated_at are epoch-second Numbers, not the
+        # human-readable submitted_at ISO string — every other Lambda that
+        # touches this record (interpret_diagnostics, request_approval,
+        # resolver, the Phase 3 reaper) writes updated_at the same way, so
+        # it stays directly comparable/sortable without a parse step.
+        now = int(time.time())
         table.put_item(
             Item={
                 "case_id": case_id,
@@ -82,9 +88,9 @@ def _start_case(case: dict) -> None:
                 "issue_type": case["issue_type"],
                 "status": "IN_PROGRESS",
                 "attempt": 1,
-                "created_at": case["submitted_at"],
-                "updated_at": case["submitted_at"],
-                "ttl": int(time.time()) + _SESSION_TTL_SECONDS,
+                "created_at": now,
+                "updated_at": now,
+                "ttl": now + _SESSION_TTL_SECONDS,
             },
             ConditionExpression="attribute_not_exists(case_id)",
         )

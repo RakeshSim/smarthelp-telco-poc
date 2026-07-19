@@ -27,3 +27,24 @@ output "ops_approval_topic_arn" {
 output "customer_notifications_topic_arn" {
   value = aws_sns_topic.customer_notifications.arn
 }
+
+output "analytics_bucket_name" {
+  value = aws_s3_bucket.analytics.bucket
+}
+
+output "athena_workgroup_name" {
+  value = aws_athena_workgroup.analytics.name
+}
+
+output "glue_database_name" {
+  value = aws_glue_catalog_database.analytics.name
+}
+
+output "dashboard_url" {
+  description = "Direct link to the CloudWatch dashboard in the console."
+  value       = "https://${var.aws_region}.console.aws.amazon.com/cloudwatch/home?region=${var.aws_region}#dashboards:name=${aws_cloudwatch_dashboard.main.dashboard_name}"
+}
+
+output "reaper_lambda_name" {
+  value = module.reaper_lambda.function_name
+}

@@ -8,15 +8,22 @@ the resolution. This repo is both a deployable AWS project and my interview
 study guide for it — architecture rationale and Q&A live in this README as
 the project grows.
 
-**Status: Phase 2 of 5 — deployed and verified in `dev`.** The full
+**Status: Phase 3 of 5 — deployed and verified in `dev`.** The full
 diagnose → interpret → act → interpret loop runs end-to-end on real AWS: a
 case submitted through API Gateway is picked up off SQS, run through a
 Step Functions Standard workflow, paused at a `waitForTaskToken` gate for
 network-impacting actions, resumed via the AWS CLI, and resolved with the
 final state written to DynamoDB and a customer notification published to
-SNS. Both the human-approval path and the fully-automatic (no approval
-needed) path have been exercised against the live deployment. Phase 3+ are
-designed but not yet built; phases are tracked at the bottom of this file.
+SNS. A scheduled reaper Lambda reconciles sessions orphaned by executions
+that die outside their own error handling, every resolved case lands one
+analytics record in S3 queryable via Athena with zero crawler/ETL infra,
+and a CloudWatch dashboard rolls up API Gateway, Step Functions, SQS,
+Lambda, and DynamoDB metrics in one place. All of it — the approval
+pause/resume loop (including a second approval gate after a failed
+reboot), a simulated orphaned session getting reconciled by the reaper,
+and an Athena query against the resulting data — has been exercised
+against the live deployment. Phase 4+ are designed but not yet built;
+phases are tracked at the bottom of this file.
 
 ## Architecture (target — grayed-out pieces arrive in later phases)
 
@@ -49,18 +56,23 @@ flowchart LR
     A -.reads.-> Secrets[["Secrets Manager\ndispatch API key"]]
     RES -.writes.-> DDB
     RES -.publishes.-> SNS(("SNS\ncustomer-notifications"))
+    RES -.writes 1 record.-> S3[("S3\nanalytics landing")]
 
-    Reaper["Reaper Lambda"] -.Phase 3.-> EventBridge["EventBridge\nscheduled rule"]
-    Reaper -.Phase 3.-> DDB
+    EventBridge["EventBridge\nrate(15 min)"] --> Reaper["Reaper Lambda"]
+    Reaper -.DescribeExecution.-> SFN
+    Reaper -.scan + reconcile.-> DDB
+    Reaper -.publishes.-> OPS
+    Reaper -.publishes.-> SNS
 
-    SFN_Loop -.Phase 3.-> S3[("S3\nanalytics landing")]
-    S3 -.Phase 3.-> Athena["Athena queries"]
+    S3 --> Glue["Glue Catalog table\n(partition projection)"]
+    Glue --> Athena["Athena queries"]
 
-    CW["CloudWatch\nLogs + Dashboard"] -.Phase 3.-> Router
-    CW -.Phase 3.-> SFN_Loop
+    CW["CloudWatch\nLogs + Dashboard"] -.-> Router
+    CW -.-> SFN_Loop
+    CW -.-> Reaper
 ```
 
-### Request flow (current, Phase 2)
+### Request flow (current, Phase 3)
 
 1. Client sends `POST /cases` to the API Gateway HTTP API `$default` stage.
 2. The **router Lambda** validates the body and does exactly one thing:
@@ -94,6 +106,19 @@ flowchart LR
    "Demo: approving a pending case" below) rather than a dedicated approval
    API/UI — deliberately, to keep the interesting content here about the
    Step Functions human-in-the-loop mechanics, not a second CRUD endpoint.
+6. `Resolver` also drops one JSON analytics record into S3
+   (`resolutions/dt=YYYY-MM-DD/case_id.json`) — the Glue Catalog table over
+   that prefix uses **partition projection**, so Athena can query new dates
+   immediately with no crawler run and no `MSCK REPAIR TABLE` step.
+7. Independently of any single execution, an **EventBridge rate rule**
+   invokes the **reaper Lambda** every 15 minutes. It scans DynamoDB for
+   sessions stuck in `IN_PROGRESS`/`PENDING_APPROVAL` longer than
+   `reaper_stale_after_minutes`, and for each one asks Step Functions
+   whether the execution is still `RUNNING`. If it's not — aborted,
+   manually stopped, or otherwise died without reaching `Resolver` — the
+   reaper force-resolves it to `EXPIRED`. If it *is* still running (a
+   slow approval), it sends a reminder notification and leaves the
+   execution alone.
 
 ## Why these choices (interview notes — grows every phase)
 
@@ -219,6 +244,47 @@ not a shortcut I chose. Worth naming directly if asked "is everything here
 least-privilege" — the honest answer is "everywhere except one
 AWS-mandated exception."
 
+**Why does the reaper compute the execution ARN instead of calling
+`ListExecutions`?** Standard Step Functions execution ARNs are
+deterministic — `<state-machine-arn-with-execution-instead-of-stateMachine>:<execution-name>`
+— and every execution's name here is exactly the `case_id` (set by the
+starter Lambda). Given a stale DynamoDB item, the reaper can build the
+exact execution ARN and call `DescribeExecution` directly: one read call
+per stuck session, not a `ListExecutions` scan plus client-side filtering.
+
+**Why does the reaper `Scan` DynamoDB instead of `Query`?** At this
+table's demo scale a `Scan` with a `FilterExpression` is simple and
+correct. A production system would add a GSI on `status` (or
+`status`+`updated_at`) so this becomes a `Query` instead — I'd bring this
+up unprompted in an interview as "the thing I'd change first before real
+traffic," since a full-table Scan is the kind of thing that works fine at
+POC scale and quietly becomes a cost/performance problem later.
+
+**Why EventBridge `rate()` instead of a `cron()` expression?** The reaper
+doesn't care about wall-clock time (midnight, business hours, etc.) — it
+just needs to run "regularly." `rate(15 minutes)` says that directly;
+`cron()` is for schedules tied to a specific time of day, which would be
+the wrong tool even though it can technically express the same interval.
+
+**Why a Glue Catalog table with partition projection instead of a Glue
+crawler?** A crawler costs money per run and needs to be re-triggered (or
+scheduled) every time a new `dt=` partition shows up in S3. Partition
+projection is a table *property* — Athena computes valid partitions from
+a date-range rule instead of reading them from the Glue Catalog's
+partition list, so a brand-new date prefix is queryable the instant data
+lands, with zero additional infrastructure. The trade-off: partition
+projection only works because the S3 key structure is predictable
+(`dt=YYYY-MM-DD/`) — a crawler would be the right call for less
+structured or externally-produced data.
+
+**Why does only `resolver` write analytics records, not the reaper too?**
+An intentional gap, not an oversight: `EXPIRED` sessions the reaper
+reconciles never reach `Resolver`, so they don't get an Athena row. I'd
+flag this myself if asked "what would you improve" — the fix is either
+having the reaper write its own analytics record, or (cleaner) having it
+invoke `resolver` directly with a `{"error": ...}`-shaped input so the
+existing single write path handles it too.
+
 ## Repo layout
 
 ```
@@ -239,11 +305,20 @@ src/
   request_approval/                # waitForTaskToken gate: persist token, notify
   act/act.py                        # performs the action (reads Secrets Manager for DISPATCH)
   interpret_results/                # resolved / loop / escalate decision
-  resolver/resolver.py              # final DynamoDB write + customer SNS notification
+  resolver/resolver.py              # final DynamoDB write + customer SNS notification + S3 analytics record
+  reaper/reaper.py                  # EventBridge-scheduled: reconciles orphaned/stale sessions
   layers/powertools/requirements.txt
-tests/                # pytest, one test module per Lambda (25 tests)
+tests/                # pytest, one test module per Lambda (29 tests)
 .github/workflows/     # CI/CD (Phase 4)
 ```
+
+Phase 3's S3 bucket, Glue Catalog database/table, Athena workgroup,
+EventBridge schedule, and CloudWatch dashboard are all single-instance
+resources defined directly in `infra/main.tf` rather than new modules —
+each only exists once in this project, so a module wrapper would be an
+abstraction with no second caller to justify it (unlike `lambda`, called
+9 times, or `step_functions`, whose ASL-templating logic is genuinely
+reusable).
 
 ## One-time setup: bootstrap the Terraform state backend
 
@@ -360,16 +435,71 @@ curl -X POST "$API/cases" -H 'content-type: application/json' \
 # decided the issue wasn't network-impacting.
 ```
 
-All three of the above were run against the real `dev` deployment while
-building this phase — not just asserted by unit tests.
+### The reaper reconciling a stuck session
+
+Submit a `modem_offline` case so it pauses for approval, then simulate the
+kind of ops mistake the reaper exists to catch — stopping the execution
+directly instead of approving/rejecting it (this bypasses the workflow's
+own `Catch` handling entirely, so `Resolver` never runs and DynamoDB is
+left claiming `PENDING_APPROVAL` forever):
+
+```bash
+CASE_ID=case-...  # from a POST /cases that pauses, as above
+SFN_ARN=$(terraform -chdir=infra output -raw state_machine_arn)
+
+aws stepfunctions stop-execution --execution-arn "$SFN_ARN:$CASE_ID" \
+  --cause "simulated ops mistake"
+# DynamoDB still says PENDING_APPROVAL — orphaned.
+```
+
+The reaper only considers sessions stale for longer than
+`reaper_stale_after_minutes` (15 by default) — backdate `updated_at` to
+skip the wait instead of actually waiting:
+
+```bash
+TABLE=$(terraform -chdir=infra output -raw sessions_table_name)
+STALE_TS=$(( $(date +%s) - 1200 ))
+aws dynamodb update-item --table-name "$TABLE" \
+  --key "{\"case_id\":{\"S\":\"$CASE_ID\"}}" \
+  --update-expression "SET updated_at = :t" \
+  --expression-attribute-values "{\":t\":{\"N\":\"$STALE_TS\"}}"
+
+aws lambda invoke --function-name "$(terraform -chdir=infra output -raw reaper_lambda_name)" \
+  --payload '{}' --cli-binary-format raw-in-base64-out /tmp/reaper-out.json
+cat /tmp/reaper-out.json
+# {"reconciled": 1}
+
+aws dynamodb get-item --table-name "$TABLE" --key "{\"case_id\":{\"S\":\"$CASE_ID\"}}" \
+  --query 'Item.status.S'
+# "EXPIRED" — the reaper caught it without waiting for the next scheduled run.
+```
+
+### Querying resolved cases with Athena
+
+```bash
+aws athena start-query-execution \
+  --query-string "SELECT resolution_type, COUNT(*) AS n FROM resolutions GROUP BY resolution_type" \
+  --query-execution-context Database="$(terraform -chdir=infra output -raw glue_database_name)" \
+  --work-group "$(terraform -chdir=infra output -raw athena_workgroup_name)"
+# then: aws athena get-query-results --query-execution-id <id-from-above>
+```
+
+No `MSCK REPAIR TABLE`, no crawler run — the `dt=YYYY-MM-DD` partition
+`resolver` just wrote is queryable immediately via partition projection.
+
+All of the above were run against the real `dev` deployment while building
+this phase — not just asserted by unit tests. The full sequence, including
+a second approval gate triggered by a failed mock reboot, is captured in
+the CloudWatch dashboard (`terraform -chdir=infra output -raw dashboard_url`).
 
 ## Cost & Teardown
 
-Everything provisioned through Phase 2 (API Gateway, 8 Lambdas + a shared
+Everything provisioned through Phase 3 (API Gateway, 9 Lambdas + a shared
 layer, DynamoDB PAY_PER_REQUEST, SQS + DLQ, SNS, Step Functions Standard,
-SSM String parameters, CloudWatch log groups) fits AWS Free Tier /
-pay-per-request pricing for demo-level traffic — nothing runs 24/7 or bills
-per-hour, **except one thing**:
+SSM String parameters, S3 + Glue Catalog + Athena, EventBridge, CloudWatch
+log groups + dashboard) fits AWS Free Tier / pay-per-request pricing for
+demo-level traffic — nothing runs 24/7 or bills per-hour, **except one
+thing**:
 
 - **Secrets Manager** (`telco-support-dev-dispatch-api-key`) bills
   ~$0.40/month flat while it exists, regardless of how often it's read.
@@ -378,7 +508,13 @@ per-hour, **except one thing**:
 
 Step Functions Standard workflows bill per state transition
 ($0.025 per 1,000) — a single case through this workflow is ~6-9
-transitions, effectively free at demo volume.
+transitions, effectively free at demo volume. The reaper's EventBridge
+`rate(15 minutes)` schedule means ~96 extra Lambda invocations/day, well
+inside the 1M/month free tier. Athena bills $5 per TB scanned — a demo
+dataset of a few KB costs a fraction of a cent per query. S3 objects
+under `resolutions/` expire automatically after `analytics_retention_days`
+(30 by default) via a lifecycle rule, so the analytics dataset can't grow
+(or cost) unbounded even if this sits deployed indefinitely.
 
 To tear down:
 
@@ -443,6 +579,21 @@ staged choice, not an oversight:
   `describe-execution` showing `SUCCEEDED`). Also confirmed the SQS queue
   drained to 0 and nothing landed in the DLQ — a clean run, not just "no
   error was thrown."
+- **Phase 3, same manual deploy process**, plus a verification pass built
+  around deliberately breaking things rather than only exercising the
+  happy path: ran a case through the approval loop *twice* (a mock reboot
+  failed, which correctly triggered a second `RequestApproval` gate for
+  the resulting `DISPATCH`), then simulated an ops mistake — calling
+  `stepfunctions stop-execution` directly instead of approving/rejecting,
+  which bypasses the workflow's own `Catch` handling on purpose — and
+  confirmed the reaper Lambda detected and reconciled the resulting
+  orphaned `PENDING_APPROVAL` record to `EXPIRED` on a manual invoke (not
+  waiting for its 15-minute schedule). Also ran a real Athena query
+  (`SELECT resolution_type, COUNT(*) ... GROUP BY resolution_type`)
+  against the S3 data the resolved cases produced and got back correct
+  counts with zero crawler/MSCK-repair step, and pulled the CloudWatch
+  dashboard's JSON definition back via the CLI to confirm all 6 widgets
+  are well-formed.
 
 ## Interview Q&A (running list — grows every phase)
 
@@ -493,6 +644,33 @@ staged choice, not an oversight:
   input (`error` present → FAILED; `approval.approved is False` → REJECTED;
   otherwise reads `outcome.resolution_type`) rather than needing three
   near-duplicate Lambdas.
+
+- **"What does the reaper actually protect against, and how did you prove
+  it works?"** → Sessions where the Step Functions execution dies outside
+  its own error handling — e.g. someone manually stops an execution in
+  the console, or (less likely but possible) the execution's own Catch
+  handling itself fails. I didn't just unit test this: I reproduced it
+  against the live deployment by calling `stepfunctions stop-execution`
+  directly (which skips Catch on purpose) and confirming the reaper's
+  next invoke picked up and fixed the resulting stuck DynamoDB record.
+- **"Why not just give the reaper a longer/shorter schedule and call it
+  done?"** → The schedule (`rate(15 minutes)`) and the staleness threshold
+  (`reaper_stale_after_minutes`) are separate knobs on purpose: the
+  schedule controls how *often* the reaper looks, the threshold controls
+  how *old* something has to be before it's considered a problem instead
+  of just "still in progress." Conflating them would mean either checking
+  too often (wasted Lambda invocations/DescribeExecution calls) or only
+  being able to tune how quickly problems get caught by also changing how
+  often the Lambda runs at all.
+- **"How would you scale the analytics pipeline if the data got big?"** →
+  Partition projection stays fine — it's O(1) regardless of data volume,
+  since Athena computes partitions from the date-range rule rather than
+  listing them. What would need to change: the resolver writing one tiny
+  object per case doesn't compact well for large-scale scanning (the
+  "small files problem"); at real volume I'd batch writes or add a Glue
+  ETL job to periodically compact `resolutions/` into larger Parquet
+  files — exactly the kind of thing the project's planned (not yet built)
+  optional Tier 3 Glue module is for.
 
 ## Learning notes (Phase 1) — concepts to know cold for interviews
 
@@ -575,12 +753,63 @@ Things worth being able to explain confidently, not just having typed:
   `TakeAction` — exercises the one branch the "Demo" section doesn't walk
   through by default.
 
+## Learning notes (Phase 3) — concepts to know cold for interviews
+
+1. **The reconciler pattern.** A scheduled job that independently verifies
+   two systems agree (here: DynamoDB's claimed status vs. Step Functions'
+   actual execution status) is a general distributed-systems pattern, not
+   something specific to this project — the same shape shows up as
+   "orphan cleanup," "drift detection," or "eventual consistency sweep" in
+   other contexts. Being able to name the pattern, not just describe this
+   one instance of it, is the actual interview signal.
+2. **Deterministic resource identifiers beat list-and-search.** The reaper
+   builds the exact Step Functions execution ARN from `case_id` instead of
+   calling `ListExecutions` and filtering — because the execution's name
+   was chosen (in `starter.py`) to make that possible. Designing
+   identifiers so related resources can be found by construction, not
+   search, is a small decision made early (Phase 2) that paid off later
+   (Phase 3) — worth telling as a connected story, not two isolated facts.
+3. **Partition projection vs. a Hive-style partitioned table.** A
+   traditional Glue table needs `MSCK REPAIR TABLE` (or a crawler run)
+   every time a new partition value appears in S3, because the Catalog
+   stores an explicit partition list. Projection replaces that list with
+   a *rule* (`dt` is a date between X and NOW) that Athena evaluates at
+   query time — new partitions are queryable the instant data lands, no
+   metadata sync step at all.
+4. **CloudWatch dashboards are just `jsonencode`d widget arrays.** There's
+   no special Terraform widget DSL — `aws_cloudwatch_dashboard.dashboard_body`
+   is a JSON blob with an `x`/`y`/`width`/`height` grid (24 units wide) and
+   a `metrics` array per widget. Knowing that demystifies both reading and
+   hand-editing dashboards outside of Terraform.
+5. **EventBridge scheduled rules need an explicit resource-based policy.**
+   `aws_lambda_permission` with `principal = "events.amazonaws.com"` and
+   `source_arn` scoped to the specific rule is what actually authorizes
+   EventBridge to invoke the reaper — the rule/target pair alone isn't
+   enough, the same way API Gateway needed its own Lambda permission
+   in Phase 1.
+
+**Exercises that build intuition on what's already deployed:**
+- Open the CloudWatch dashboard (`terraform -chdir=infra output -raw
+  dashboard_url`) right after running the demo above and watch the Step
+  Functions and Lambda-errors widgets reflect the executions you just ran.
+- Manually add a second, malformed JSON file under
+  `resolutions/dt=<today>/` in the analytics bucket (`aws s3 cp`) and
+  re-run the Athena query — see how a single bad record affects (or
+  doesn't) the rest of the query, a realistic "one producer misbehaves"
+  scenario.
+- Change `reaper_stale_after_minutes` in `dev.tfvars`, `terraform apply`,
+  and watch the Lambda's env var update — confirms the config is actually
+  wired through Terraform, not hardcoded, without needing to touch code.
+
 ## Phases
 
 - [x] **Phase 1** — Terraform skeleton, backend, one Lambda, API Gateway (live)
 - [x] **Phase 2** — Step Functions workflow, DynamoDB, SQS, SNS, SSM, Secrets
       Manager, diagnose/act Lambdas, human-approval gate (live, end-to-end
       verified: pause/approve/resolve and full auto-resolve paths)
-- [ ] **Phase 3** — EventBridge reaper, CloudWatch dashboard, S3/Athena analytics
+- [x] **Phase 3** — EventBridge reaper, CloudWatch dashboard, S3/Athena
+      analytics (live, end-to-end verified: reaper reconciles a simulated
+      orphaned session, Athena query returns correct counts via partition
+      projection, dashboard confirmed well-formed)
 - [ ] **Phase 4** — GitHub Actions CI/CD
 - [ ] **Phase 5 (optional, disabled by default)** — RDS/VPC, Glue/EMR, OpenSearch

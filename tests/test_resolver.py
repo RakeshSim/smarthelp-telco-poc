@@ -23,29 +23,41 @@ def aws(monkeypatch):
         topic_arn = sns.create_topic(Name="telco-support-test-customer-notifications")["TopicArn"]
         monkeypatch.setenv("CUSTOMER_NOTIFICATIONS_TOPIC_ARN", topic_arn)
 
-        importlib.reload(resolver)  # module-level dynamodb/sns clients need the mock (and the real topic ARN) active
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket="telco-support-test-analytics")
 
-        yield table
+        importlib.reload(resolver)  # module-level dynamodb/sns/s3 clients need the mock (and the real topic ARN) active
+
+        yield table, s3
 
 
 def test_resolved_outcome_is_written_and_customer_notified(aws, lambda_context):
+    table, s3 = aws
     event = {
         "case_id": "case-1",
+        "customer_id": "cust-123",
         "issue_type": "modem_offline",
+        "attempt": 1,
+        "decision": {"recommended_action": "REBOOT", "network_impacting": True},
         "outcome": {"resolved": True, "resolution_type": "RESOLVED"},
     }
 
     result = resolver.lambda_handler(event, lambda_context)
 
     assert result == {"case_id": "case-1", "resolution_type": "RESOLVED"}
-    item = aws.get_item(Key={"case_id": "case-1"})["Item"]
+    item = table.get_item(Key={"case_id": "case-1"})["Item"]
     assert item["status"] == "RESOLVED"
     assert "task_token" not in item  # cleaned up now that the workflow has ended
+
+    objects = s3.list_objects_v2(Bucket="telco-support-test-analytics", Prefix="resolutions/")["Contents"]
+    assert len(objects) == 1
+    assert objects[0]["Key"].endswith("case-1.json")
 
 
 def test_rejected_approval_is_derived_from_approval_flag(aws, lambda_context):
     event = {
         "case_id": "case-1",
+        "customer_id": "cust-123",
         "issue_type": "modem_offline",
         "decision": {"recommended_action": "REBOOT", "network_impacting": True},
         "approval": {"approved": False},
@@ -59,6 +71,7 @@ def test_rejected_approval_is_derived_from_approval_flag(aws, lambda_context):
 def test_failure_is_derived_from_error_key(aws, lambda_context):
     event = {
         "case_id": "case-1",
+        "customer_id": "cust-123",
         "issue_type": "modem_offline",
         "error": {"Error": "States.TaskFailed", "Cause": "boom"},
     }

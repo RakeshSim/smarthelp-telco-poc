@@ -54,7 +54,7 @@ def lambda_handler(event: dict, context: LambdaContext) -> dict:
         ExpressionAttributeValues={
             ":attempt": state["attempt"],
             ":action": decision["recommended_action"],
-            ":now": str(int(time.time())),
+            ":now": int(time.time()),
         },
     )
 
