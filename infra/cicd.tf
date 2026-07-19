@@ -69,10 +69,16 @@ data "aws_iam_policy_document" "gha_apply_trust" {
     }
     condition {
       test = "StringEquals"
-      # Only a push to main — never a pull_request event, from this repo
-      # or a fork — can assume the role with write access.
+      # When a job specifies `environment:`, GitHub Actions swaps the sub
+      # claim's suffix from the ref to the environment name — confirmed
+      # empirically via a debug step, since this isn't the format most
+      # docs/examples show. This means the trust boundary and the
+      # required-reviewer approval gate are both keyed off the same
+      # "aws-deploy" GitHub Environment, not two independently-configured
+      # checks that happen to agree — one less thing that could drift out
+      # of sync with the other.
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["${var.github_oidc_subject_prefix}:ref:refs/heads/main"]
+      values   = ["${var.github_oidc_subject_prefix}:environment:aws-deploy"]
     }
   }
 }
