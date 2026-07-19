@@ -414,15 +414,20 @@ no long-lived secret sitting in GitHub at all. `infra/cicd.tf` sets this
 up: one `aws_iam_openid_connect_provider` plus two roles.
 
 **Why two roles instead of one?** `gha-plan`'s trust policy accepts any
-ref in this repo (so a PR workflow can assume it) but only holds
-`ReadOnlyAccess` plus read/write on Terraform's own state object —
-harmless even if a malicious PR tried to abuse it. `gha-apply`'s trust
-policy is restricted with `StringEquals` (not `StringLike`) to exactly
-`repo:RakeshSim/smarthelp-telco-poc:ref:refs/heads/main` — only a
-workflow run triggered by a push to `main` can assume it, never a PR
-build. A single role trusted broadly but holding write access would mean
-any PR — including from a fork, if this were a more permissive repo
-config — could assume a role capable of changing real infrastructure.
+event in this repo via `StringLike` on `sub` (so a PR workflow can assume
+it) but only holds `ReadOnlyAccess` plus read/write on Terraform's own
+state object — harmless even if a malicious PR tried to abuse it.
+`gha-apply`'s trust policy is restricted with `StringEquals` to exactly
+`repo:<owner>@<owner_id>/<repo>@<repo_id>:environment:aws-deploy` — only
+a workflow run for a job that specifies `environment: aws-deploy` can
+assume it, never a plain PR build. (The numeric owner/repo IDs, and the
+fact that specifying an `environment:` swaps the claim's suffix from a
+ref to the environment name, aren't obvious from most docs/examples — I
+confirmed both empirically with a temporary debug step that decoded a
+real token's claims; see "Deployment history" below.) A single role
+trusted broadly but holding write access would mean any PR — including
+from a fork, if this were a more permissive repo config — could assume a
+role capable of changing real infrastructure.
 
 **Why does `gha-apply`'s policy scope IAM actions separately from
 everything else?** The rest of the policy (`lambda:*`, `dynamodb:*`,
@@ -670,6 +675,38 @@ staged choice, not an oversight:
   counts with zero crawler/MSCK-repair step, and pulled the CloudWatch
   dashboard's JSON definition back via the CLI to confirm all 6 widgets
   are well-formed.
+- **Phase 4 is the one phase where "it worked on the first try" would
+  have been a red flag, not a good sign** — OIDC trust policies fail
+  closed with an opaque `AccessDenied`/`Not authorized` error and no
+  detail about *which* claim didn't match, so getting it right requires
+  actually hitting and diagnosing those failures, not just writing
+  plausible-looking Terraform. What actually happened, in order: (1) the
+  first `terraform-plan` PR check failed assuming the read-only role at
+  all — root cause was an outdated OIDC thumbprint from GitHub's 2023 CA
+  rotation; (2) after fixing that, it failed again on the *same* error —
+  a debug workflow step that decoded a real token's claims showed
+  GitHub's actual `sub` format embeds numeric owner/repo IDs
+  (`repo:owner@id/repo@id:...`), not the name-only format most
+  docs/examples show; (3) with auth fixed, `terraform plan` itself then
+  failed on `secretsmanager:GetSecretValue` — `ReadOnlyAccess` deliberately
+  excludes reading actual secret values; (4) and on `archive_file` "could
+  not archive missing" — the Lambda layer's build output is gitignored
+  and only exists on whichever machine last ran `apply`, so a fresh CI
+  checkout needs its own build step; (5) merging to `main` then failed
+  the *apply* role the same way the plan role initially had, but with a
+  twist: a debug capture showed that specifying `environment:` on a job
+  changes the `sub` claim to key off the **environment name**, not the
+  ref, once `id-token: write`; (6) and the first real `apply` failed once
+  more on `iam:GetOpenIDConnectProvider`, since Terraform refreshes the
+  OIDC provider resource on every apply and that ARN namespace wasn't
+  covered by the role-scoped IAM statement. Every fix was verified by
+  re-running the actual PR/merge/approve flow against live AWS and
+  GitHub, not just re-reading the Terraform. The final, successful
+  `terraform-apply` run replaced the Lambda layer and updated all 9
+  functions' layer reference once — expected, since the layer built on
+  my Mac and CI's Linux runner produce different zip bytes for identical
+  package content; confirmed this stabilizes going forward by observing
+  that a subsequent CI-triggered plan showed no further changes.
 
 ## Interview Q&A (running list — grows every phase)
 
@@ -760,17 +797,41 @@ staged choice, not an oversight:
   independent controls, not one: the `gha-plan` role a PR's workflow
   assumes only has `ReadOnlyAccess` (it *can't* change anything even if
   it tried), and separately the `gha-apply` role's trust policy uses
-  `StringEquals` on the exact `sub` claim for a push to `main` — a PR
-  event produces a different `sub` value entirely, so it couldn't assume
-  that role even if it tried to. Belt and suspenders, not just one gate.
+  `StringEquals` on the exact `sub` claim — which only a job specifying
+  `environment: aws-deploy` produces — so a plain PR workflow's `sub`
+  value doesn't match and it couldn't assume that role even if it tried
+  to. Belt and suspenders, not just one gate.
 - **"Why gate `apply` behind a required reviewer if `gha-apply` is
-  already restricted to `main`?"** → Different failure modes. The IAM
-  trust policy stops the *wrong workflow* (a PR) from deploying; the
-  required-reviewer environment stops the *right* workflow from
+  already restricted to the deploy environment?"** → Different failure
+  modes, even though they're keyed off the same GitHub Environment here.
+  The IAM trust policy stops the *wrong workflow* (a PR) from deploying;
+  the required-reviewer protection rule stops the *right* workflow from
   deploying *automatically* the instant someone merges, giving a human a
   last look at the plan output before real AWS resources change. One is
   an authentication control, the other is a change-management control —
   worth naming the distinction if asked to justify having both.
+- **"How did you actually verify the OIDC trust policies were correct,
+  rather than just believing the Terraform looked right?"** → I didn't
+  trust the docs' example `sub` format — I added a temporary workflow
+  step that requests the real ID token via
+  `ACTIONS_ID_TOKEN_REQUEST_URL`/`ACTIONS_ID_TOKEN_REQUEST_TOKEN`, decodes
+  its JWT payload, and prints the claims. That's what caught both the
+  owner/repo-ID format and the environment-based `sub` for a job with
+  `environment:` set — neither of which I'd have found by re-reading the
+  Terraform harder. Worth remembering generally: when an opaque
+  auth-layer error doesn't say *why* it failed, get the actual claims/
+  request instead of iterating on guesses.
+- **"Why did the first successful `terraform apply` from CI touch every
+  single Lambda function, not just the CI/CD resources you'd just
+  added?"** → `archive_file`'s hash isn't just a function of package
+  *content* — the zip a local `pip install` produces on macOS and the zip
+  the same command produces on CI's Ubuntu runner aren't byte-identical,
+  so the Lambda layer's version — and therefore every function's `layers`
+  reference — changed once when CI became the one building it. Expected
+  and harmless (same dependency versions, different build environment),
+  but a good example of *why* deploys should come from one consistent
+  place once CI/CD exists, rather than alternating between a laptop and
+  a pipeline against the same state.
 
 ## Learning notes (Phase 1) — concepts to know cold for interviews
 
@@ -962,5 +1023,9 @@ Things worth being able to explain confidently, not just having typed:
       analytics (live, end-to-end verified: reaper reconciles a simulated
       orphaned session, Athena query returns correct counts via partition
       projection, dashboard confirmed well-formed)
-- [ ] **Phase 4** — GitHub Actions CI/CD
+- [x] **Phase 4** — GitHub Actions CI/CD via OIDC (live, end-to-end verified:
+      a real PR's `terraform-plan` posted to the Step Summary, merging to
+      `main` triggered `terraform-apply`, held at the `aws-deploy`
+      environment's required-reviewer gate, approved via the API, and
+      applied successfully)
 - [ ] **Phase 5 (optional, disabled by default)** — RDS/VPC, Glue/EMR, OpenSearch
