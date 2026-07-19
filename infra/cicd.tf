@@ -48,7 +48,7 @@ data "aws_iam_policy_document" "gha_plan_trust" {
     condition {
       test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_repo}:*"]
+      values   = ["${var.github_oidc_subject_prefix}:*"]
     }
   }
 }
@@ -72,7 +72,7 @@ data "aws_iam_policy_document" "gha_apply_trust" {
       # Only a push to main — never a pull_request event, from this repo
       # or a fork — can assume the role with write access.
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_repo}:ref:refs/heads/main"]
+      values   = ["${var.github_oidc_subject_prefix}:ref:refs/heads/main"]
     }
   }
 }
