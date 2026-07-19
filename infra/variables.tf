@@ -67,6 +67,34 @@ variable "analytics_retention_days" {
   default     = 30
 }
 
+variable "github_oidc_subject_prefix" {
+  description = <<-EOT
+    The fixed part of this repo's GitHub Actions OIDC `sub` claim, used to
+    scope the trust policies in cicd.tf. GitHub's current format embeds
+    the numeric owner/repo IDs, not just their names —
+    repo:<owner>@<owner_id>/<repo>@<repo_id> — specifically so that
+    renaming or transferring the repo doesn't let a *different* future
+    repo with the same name inherit trust. Confirmed empirically via a
+    debug workflow step that decoded a real token's claims rather than
+    assumed from older docs showing the name-only format.
+  EOT
+  type        = string
+  default     = "repo:RakeshSim@32040828/smarthelp-telco-poc@1305412004"
+}
+
+variable "manage_github_oidc" {
+  description = <<-EOT
+    Whether this environment's Terraform manages the GitHub Actions OIDC
+    provider + roles. The OIDC provider is an account-global resource
+    (one per URL, not per environment) — only one environment should
+    manage it per AWS account, so this is true for dev and false for
+    qa/prod to avoid a duplicate-resource error if they ever share an
+    account.
+  EOT
+  type        = bool
+  default     = false
+}
+
 # --- Optional tiers (Phase 5) ---------------------------------------------
 # Kept false so `terraform apply` never provisions anything that costs money
 # beyond the always-free-tier LIVE services. Flip to true deliberately and

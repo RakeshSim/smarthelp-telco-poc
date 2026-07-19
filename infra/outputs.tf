@@ -48,3 +48,13 @@ output "dashboard_url" {
 output "reaper_lambda_name" {
   value = module.reaper_lambda.function_name
 }
+
+output "gha_plan_role_arn" {
+  description = "Paste into the GitHub repo as the AWS_GHA_PLAN_ROLE_ARN variable."
+  value       = var.manage_github_oidc ? aws_iam_role.gha_plan[0].arn : null
+}
+
+output "gha_apply_role_arn" {
+  description = "Paste into the GitHub repo as the AWS_GHA_APPLY_ROLE_ARN variable."
+  value       = var.manage_github_oidc ? aws_iam_role.gha_apply[0].arn : null
+}
