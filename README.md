@@ -1029,3 +1029,4 @@ Things worth being able to explain confidently, not just having typed:
       environment's required-reviewer gate, approved via the API, and
       applied successfully)
 - [ ] **Phase 5 (optional, disabled by default)** — RDS/VPC, Glue/EMR, OpenSearch
+
