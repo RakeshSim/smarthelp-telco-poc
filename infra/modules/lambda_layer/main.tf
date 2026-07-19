@@ -30,6 +30,14 @@ resource "terraform_data" "install" {
         --python-version 3.12 \
         --only-binary=:all: \
         --target "${local.python_dir}"
+      # pip writes each file with its own extraction-time mtime, which
+      # differs on every install even when the installed package content
+      # is byte-identical — that alone changes the zip's hash below and
+      # was observed forcing a spurious "layer must be replaced" (and,
+      # transitively, every function referencing it) on every apply.
+      # Normalizing to a fixed timestamp makes the archive reproducible
+      # across machines and across time, not just across content.
+      find "${local.layer_build_path}" -exec touch -t 202001010000 {} +
     EOT
   }
 }
