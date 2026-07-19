@@ -17,11 +17,18 @@ resource "aws_iam_openid_connect_provider" "github_actions" {
 
   url            = "https://token.actions.githubusercontent.com"
   client_id_list = ["sts.amazonaws.com"]
-  # AWS now validates GitHub's OIDC certificate chain automatically for
-  # this well-known provider URL regardless of the value here — a
-  # thumbprint is still a required argument to create the resource, so
-  # this is GitHub's documented root CA thumbprint for that purpose.
-  thumbprint_list = ["6938fd4d98bab03faadb97b34396831e3780aea1"]
+  # AWS documents that it now validates GitHub's OIDC certificate chain
+  # automatically for this well-known provider URL, making the exact
+  # thumbprint value irrelevant — but a non-empty thumbprint_list is still
+  # a required argument to create the resource, and in practice requests
+  # were rejected with the original (2021) DigiCert thumbprint alone after
+  # GitHub's 2023 intermediate CA rotation. Both values are listed so this
+  # keeps working regardless of which validation path AWS actually takes
+  # for this account/region.
+  thumbprint_list = [
+    "6938fd4d98bab03faadb97b34396831e3780aea1",
+    "1c58a3a8518e8759bf075b76b750d4f2df264fcd",
+  ]
 }
 
 data "aws_iam_policy_document" "gha_plan_trust" {
