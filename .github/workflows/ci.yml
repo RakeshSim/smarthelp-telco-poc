@@ -42,6 +42,26 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # The Lambda layer's zip (infra/build/layers/.../python) is built by
+      # a local-exec provisioner keyed to requirements.txt's hash, not
+      # committed to git — it only exists on whatever machine last ran
+      # `terraform apply`. On a fresh CI checkout it's simply missing, so
+      # the archive_file data source errors during `plan` unless something
+      # rebuilds it first. This mirrors modules/lambda_layer/main.tf's own
+      # pip install command exactly; if that command ever changes, update
+      # this step to match.
+      - name: pre-build lambda layer (CI/local build parity)
+        run: |
+          mkdir -p infra/build/layers/telco-support-dev-powertools/python
+          pip3 install -r src/layers/powertools/requirements.txt \
+            --platform manylinux2014_x86_64 \
+            --implementation cp \
+            --python-version 3.12 \
+            --only-binary=:all: \
+            --target infra/build/layers/telco-support-dev-powertools/python
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_GHA_PLAN_ROLE_ARN }}
@@ -83,6 +103,19 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # See the matching step in terraform-plan for why this is needed.
+      - name: pre-build lambda layer (CI/local build parity)
+        run: |
+          mkdir -p infra/build/layers/telco-support-dev-powertools/python
+          pip3 install -r src/layers/powertools/requirements.txt \
+            --platform manylinux2014_x86_64 \
+            --implementation cp \
+            --python-version 3.12 \
+            --only-binary=:all: \
+            --target infra/build/layers/telco-support-dev-powertools/python
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_GHA_APPLY_ROLE_ARN }}

@@ -124,6 +124,27 @@ resource "aws_iam_role_policy" "gha_apply_backend" {
   policy = data.aws_iam_policy_document.terraform_backend_access[0].json
 }
 
+# ReadOnlyAccess deliberately excludes secretsmanager:GetSecretValue —
+# reading actual secret *values* isn't "read-only" in the sense that
+# policy means it, even though `terraform plan` needs it here to refresh
+# the aws_secretsmanager_secret_version resource and detect drift. Scoped
+# to just this project's secret(s), not every secret in the account.
+data "aws_iam_policy_document" "gha_plan_secrets_refresh" {
+  count = var.manage_github_oidc ? 1 : 0
+
+  statement {
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = ["arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:${local.name_prefix}-*"]
+  }
+}
+
+resource "aws_iam_role_policy" "gha_plan_secrets_refresh" {
+  count  = var.manage_github_oidc ? 1 : 0
+  name   = "${local.name_prefix}-gha-plan-secrets-refresh"
+  role   = aws_iam_role.gha_plan[0].id
+  policy = data.aws_iam_policy_document.gha_plan_secrets_refresh[0].json
+}
+
 # Plan only ever needs to read/diff — AWS's own ReadOnlyAccess managed
 # policy is the appropriate scope for a role a pull request can assume.
 resource "aws_iam_role_policy_attachment" "gha_plan_readonly" {
