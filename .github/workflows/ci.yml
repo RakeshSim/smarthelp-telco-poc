@@ -62,6 +62,12 @@ jobs:
             --python-version 3.12 \
             --only-binary=:all: \
             --target infra/build/layers/telco-support-dev-powertools/python
+          # This step's own pip install is what archive_file actually zips
+          # on every CI run (modules/lambda_layer's local-exec only re-runs
+          # when requirements.txt's hash changes, which it hasn't since
+          # Phase 1 — so its own mtime-normalization never re-executes on
+          # a repeat apply). Normalize here too, matching the module.
+          find infra/build/layers/telco-support-dev-powertools -exec touch -t 202001010000 {} +
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_GHA_PLAN_ROLE_ARN }}
@@ -116,6 +122,12 @@ jobs:
             --python-version 3.12 \
             --only-binary=:all: \
             --target infra/build/layers/telco-support-dev-powertools/python
+          # This step's own pip install is what archive_file actually zips
+          # on every CI run (modules/lambda_layer's local-exec only re-runs
+          # when requirements.txt's hash changes, which it hasn't since
+          # Phase 1 — so its own mtime-normalization never re-executes on
+          # a repeat apply). Normalize here too, matching the module.
+          find infra/build/layers/telco-support-dev-powertools -exec touch -t 202001010000 {} +
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_GHA_APPLY_ROLE_ARN }}
